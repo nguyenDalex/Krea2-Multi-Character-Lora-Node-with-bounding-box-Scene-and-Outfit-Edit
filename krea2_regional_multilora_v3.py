@@ -16,9 +16,12 @@ and shows an inline thumbnail. The filename is stored in regions_json as
 
 regions_json schema (v3):
     [
-      {"lora": "character_A.safetensors", "strength": 1.1, "enable": true,
+      {"enable": true, "loras": [
+        {"lora": "character_A.safetensors", "strength": 1.1, "enable": true},
+        {"lora": "outfit_A.safetensors", "strength": 0.8, "enable": true}
+      ],
        "ref_image": "charA_ref.png"},
-      {"lora": "None", "strength": 1.1, "enable": true,
+      {"enable": true, "loras": [],
        "ref_image": "prop.png"}          # ref-only region: no LoRA, still molded
     ]
 
@@ -37,6 +40,7 @@ from PIL import Image, ImageOps
 import folder_paths
 
 from .krea2_regional_multilora import (
+    _active_loras,
     _auto_split_norm,
     _coerce_bbox_norm,
     _load_lora_matrices,
@@ -58,8 +62,8 @@ WRAPPER_KEY_V3 = "krea2_regional_multilora_v3"
 
 DEFAULT_REGIONS_JSON_V3 = (
     "[\n"
-    '  {"lora": "None", "strength": 1.1, "enable": true, "ref_image": ""},\n'
-    '  {"lora": "None", "strength": 1.1, "enable": true, "ref_image": ""}\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.1, "enable": true}], "ref_image": ""},\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.1, "enable": true}], "ref_image": ""}\n'
     "]"
 )
 
@@ -116,8 +120,8 @@ class Krea2RegionalMultiLoRAV3:
                     "default": DEFAULT_REGIONS_JSON_V3,
                     "tooltip": (
                         "JSON array of regions, in box order. The row buttons edit this "
-                        'for you. Each: {"lora": "file.safetensors", "strength": 1.1, '
-                        '"enable": true, "ref_image": "uploaded.png"}. '
+                        'for you. Each region has "loras": [{"lora":"file.safetensors",'
+                        '"strength":1.1,"enable":true}], plus "ref_image":"uploaded.png". '
                         "ref_image is set by the per-row 'load ref' button."
                     ),
                 }),
@@ -211,7 +215,7 @@ class Krea2RegionalMultiLoRAV3:
         regions = _parse_regions_v3(regions_json)
 
         def has_lora(r):
-            return r["lora"] not in ("None", "") and (r["strength"] * base_strength) != 0.0
+            return bool(_active_loras(r, base_strength))
 
         def has_ref(r):
             # A reference only counts if it's loaded AND its per-row toggle is on.
@@ -252,26 +256,33 @@ class Krea2RegionalMultiLoRAV3:
         # ------------------------------------------------------------------
         file_cache = {}
         region_loras = []
-        strength_eff = []
+        active_region_loras = []
+        total_adapters = 0
         for r in active:
-            if not has_lora(r):
+            adapters = _active_loras(r, base_strength)
+            active_region_loras.append(adapters)
+            if not adapters:
                 region_loras.append({})   # ref-only row: holds its box, no LoRA
-                strength_eff.append(0.0)
                 continue
-            path = _resolve_lora_path(r["lora"])
-            if path not in file_cache:
-                file_cache[path] = _load_lora_matrices(path)
-            base_mats = file_cache[path]
-            s = r["strength"] * float(base_strength)
-            strength_eff.append(s)
-            mats = {
-                sig: {**{k: v for k, v in d.items() if k != "scale"},
-                      "scale": d["scale"] * s}
-                for sig, d in base_mats.items()
-            }
-            if not mats:
-                logging.warning("[Krea2RegionalMultiLoRAV3] '%s' contains no LoRA (A/B) "
-                                "or LoKr (kron factor) pairs.", r["lora"])
+            mats = {}
+            for adapter in adapters:
+                path = _resolve_lora_path(adapter["lora"])
+                if path not in file_cache:
+                    file_cache[path] = _load_lora_matrices(path)
+                base_mats = file_cache[path]
+                if not base_mats:
+                    logging.warning(
+                        "[Krea2RegionalMultiLoRAV3] '%s' contains no LoRA (A/B) "
+                        "or LoKr (kron factor) pairs.",
+                        adapter["lora"],
+                    )
+                    continue
+                total_adapters += 1
+                for sig, d in base_mats.items():
+                    mats.setdefault(sig, []).append({
+                        **{k: v for k, v in d.items() if k != "scale"},
+                        "scale": d["scale"] * float(adapter["effective_strength"]),
+                    })
             region_loras.append(mats)
 
         patched = model.clone()
@@ -371,19 +382,26 @@ class Krea2RegionalMultiLoRAV3:
         }
         node_data = {
             "adapters": [
-                {"name": r["name"], "lora": r["lora"], "strength": s,
-                 "ref_image": r.get("ref_image", ""),
-                 "ref_enable": r.get("ref_enable", True)}
-                for r, s in zip(active, strength_eff)
+                {
+                    "name": r["name"],
+                    "loras": [
+                        {"lora": a["lora"], "strength": float(a["effective_strength"])}
+                        for a in adapters
+                    ],
+                    "ref_image": r.get("ref_image", ""),
+                    "ref_enable": r.get("ref_enable", True),
+                }
+                for r, adapters in zip(active, active_region_loras)
             ],
             "model_type": "krea2",
             "engine": "activation_delta+latent_mold",
+            "lora_adapters": total_adapters,
         }
 
         logging.info(
-            "[Krea2RegionalMultiLoRAV3] armed: %d regions (%d with LoRA, %d with ref), "
+            "[Krea2RegionalMultiLoRAV3] armed: %d regions (%d LoRA adapters, %d with ref), "
             "split=%s, feather=%.2f, ref_strength=%.2f window %.2f-%.2f",
-            len(active), sum(1 for r in active if has_lora(r)), len(ref_entries),
+            len(active), total_adapters, len(ref_entries),
             split_mode, seam_feather, ref_strength, ref_start_percent, ref_end_percent,
         )
         return (patched, clip, masks_payload, node_data)

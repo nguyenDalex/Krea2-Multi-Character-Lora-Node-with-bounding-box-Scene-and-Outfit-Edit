@@ -46,6 +46,8 @@ import comfy.sd
 import comfy.utils
 
 from .krea2_regional_multilora import (
+    _active_loras,
+    _primary_lora,
     _pext,
     _WRAPPER_ENUM,
     _auto_split_norm,
@@ -81,8 +83,8 @@ WRAPPER_KEY_V9 = "krea2_regional_multilora_v9"
 
 DEFAULT_REGIONS_JSON_V9 = (
     "[\n"
-    '  {"lora": "None", "strength": 1.15, "enable": true, "ref_image": "", "prompt": "a man"},\n'
-    '  {"lora": "None", "strength": 1.15, "enable": true, "ref_image": "", "prompt": "a woman"}\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.15, "enable": true}], "ref_image": "", "prompt": "a man"},\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.15, "enable": true}], "ref_image": "", "prompt": "a woman"}\n'
     "]"
 )
 
@@ -653,7 +655,8 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
                     "multiline": True,
                     "default": DEFAULT_REGIONS_JSON_V9,
                     "tooltip": (
-                        "One row per box. Set character LoRA + in-node Load Ref photo "
+                        "One region row per box. Each region can stack multiple LoRAs "
+                        "plus an in-node Load Ref photo "
                         "for V2 likeness. Standalone LoadImage refs go on extra_ref_*."
                     ),
                 }),
@@ -980,7 +983,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
         regions = _parse_regions_v3(regions_json)
 
         def has_lora(r):
-            return r["lora"] not in ("None", "") and (r["strength"] * base_strength) != 0.0
+            return bool(_active_loras(r, base_strength))
 
         def has_ref(r):
             return bool(r.get("ref_image")) and r.get("ref_enable", True)
@@ -1008,7 +1011,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             logging.warning("[V9/V2] no bboxes; auto_vertical split.")
             norm_boxes = _auto_split_norm(len(active), "auto_vertical")
 
-        patched, strength_eff, n_lora = self._arm_regional_loras(
+        patched, region_adapters, n_lora = self._arm_regional_loras(
             model, active, norm_boxes, cw, ch, seam_feather, blend_override, base_strength)
 
         preview_imgs = []
@@ -1023,17 +1026,20 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             "adapters": [
                 {
                     "name": r["name"],
-                    "lora": r["lora"],
-                    "strength": s,
+                    "loras": [
+                        {"lora": a["lora"], "strength": float(a["effective_strength"])}
+                        for a in adapters
+                    ],
                     "ref_image": r.get("ref_image", ""),
                     "ref_enable": r.get("ref_enable", True),
                 }
-                for r, s in zip(active, strength_eff)
+                for r, adapters in zip(active, region_adapters)
             ],
             "model_type": "krea2",
             "engine": "v9_v2_lora+mold",
             "mode": "v2_likeness",
             "loras": n_lora,
+            "lora_adapters": n_lora,
             "molds": n_mold,
             "ref_paths": {
                 "in_node_region_refs": n_mold,
@@ -1041,7 +1047,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             },
         }
         logging.info(
-            "[V9] V2 likeness: %d regions (%d LoRA, %d in-node mold), "
+            "[V9] V2 likeness: %d regions, %d LoRA adapters, %d in-node mold(s), "
             "ref_strength=%.2f window %.2f-%.2f",
             len(active), n_lora, n_mold, float(ref_strength),
             float(ref_start_percent), float(ref_end_percent),
@@ -1064,16 +1070,19 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
         if "background" not in p.lower():
             p = (f"{p}, plain neutral gray background, upper body, looking at camera, "
                  "sharp focus, soft natural lighting")
-        s = float(region["strength"]) * float(base_strength)
+        primary = _primary_lora(region, base_strength)
+        if primary is None:
+            return None
+        s = float(primary["effective_strength"])
         logging.info("[V9/edit] region %d: auto portrait from %s @%dx%d (%d steps, str %.2f)",
-                     idx, region["lora"], pw, ph, int(steps), s)
+                     idx, primary["lora"], pw, ph, int(steps), s)
         try:
-            lat = self._gen_portrait_latent(model, clip, region["lora"], s, p, pw, ph,
+            lat = self._gen_portrait_latent(model, clip, primary["lora"], s, p, pw, ph,
                                             int(steps), int(seed) + idx * 1000)
             return self._decode_px(vae, lat)
         except Exception as e:
             logging.warning("[V9/edit] auto portrait failed for region %d (%s): %s",
-                            idx, region.get("lora"), e)
+                            idx, primary["lora"], e)
             return None
 
     # ------------------------------------------------------------------
@@ -1127,7 +1136,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             return bool(r.get("ref_image")) and r.get("ref_enable", True)
 
         def has_lora(r):
-            return r["lora"] not in ("None", "") and (r["strength"] * base_strength) != 0.0
+            return bool(_active_loras(r, base_strength))
 
         # Edit subjects: an in-node Load Ref photo, or — where the region opted in
         # via its portrait toggle — the region's LoRA rendered alone. Without a
@@ -1151,7 +1160,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
                 logging.info(
                     "[V9/edit] region '%s': portrait off — direct LoRA + bbox text "
                     "routing will be used (no portrait diffusion pass).",
-                    r.get("name") or r.get("lora") or "?",
+                    r.get("name") or (_primary_lora(r, base_strength) or {}).get("lora") or "?",
                 )
 
         empty = torch.zeros(1, 64, 64, 3)
@@ -1341,7 +1350,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
                 "LoRA deltas remain boxed but placement may be seed-dependent."
             )
 
-        patched, _, n_lora = self._arm_regional_loras(
+        patched, lora_region_adapters, n_lora = self._arm_regional_loras(
             edit_model, lora_active, lora_boxes, cw, ch,
             seam_feather, blend_override, base_strength,
             wrapper_key=WRAPPER_KEY_V9,
@@ -1366,12 +1375,14 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             "adapters": [
                 {
                     "name": r["name"],
-                    "lora": r["lora"],
-                    "strength": float(r.get("strength", 1.0)) * float(base_strength),
+                    "loras": [
+                        {"lora": a["lora"], "strength": float(a["effective_strength"])}
+                        for a in adapters
+                    ],
                     "ref_image": r.get("ref_image", ""),
                     "source": "in_node_ref",
                 }
-                for r in active[: len(placed)]
+                for r, adapters in zip(lora_active, lora_region_adapters)
             ],
             "model_type": "krea2",
             "engine": engine,
@@ -1379,6 +1390,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
             "subjects": len(placed),
             "externals": len(extras),
             "character_loras_armed": n_lora,
+            "character_lora_adapters_armed": n_lora,
             "molds": n_mold,
             "reference_frames": len(src_latents),
             "spatial_conditioning": spatial_on,
@@ -1391,8 +1403,8 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
         # edit_lora_strength is logged next to the character strengths because the
         # two deltas stack in one forward; their SUM is what drives artifacts.
         char_strengths = [
-            round(float(r.get("strength", 1.0)) * float(base_strength), 2)
-            for r in lora_active if has_lora(r)
+            f'{a["lora"]}@{round(float(a["effective_strength"]), 2)}'
+            for r in lora_active for a in _active_loras(r, base_strength)
         ]
         # Sequence length is the dominant cost in this node and it is invisible
         # otherwise, so spell it out: every reference frame is concatenated into
@@ -1408,7 +1420,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
         )
         logging.info(
             "[V9] krea2edit+V2: %s | %d in-node photo(s), %d LoadImage plate(s), "
-            "%d krea2edit frame(s), %d char LoRA(s) %s, %d mold(s) strength=%.2f, "
+            "%d krea2edit frame(s), %d char LoRA adapter(s) %s, %d mold(s) strength=%.2f, "
             "edit_lora=%.2f",
             engine, len(placed), len(extras), len(src_latents), n_lora,
             char_strengths, n_mold, float(ref_strength), float(edit_lora_strength),
@@ -1446,28 +1458,32 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
     ):
         file_cache = {}
         region_loras = []
-        strength_eff = []
+        region_adapters = []
+        total_adapters = 0
         for r in active:
-            if r["lora"] in ("None", "") or (r["strength"] * base_strength) == 0.0:
+            adapters = _active_loras(r, base_strength)
+            region_adapters.append(adapters)
+            if not adapters:
                 region_loras.append({})
-                strength_eff.append(0.0)
                 continue
-            path = _resolve_lora_path(r["lora"])
-            if path not in file_cache:
-                file_cache[path] = _load_lora_matrices(path)
-            s = float(r["strength"]) * float(base_strength)
-            strength_eff.append(s)
-            base_mats = file_cache[path]
-            mats = {
-                sig: {**{k: v for k, v in d.items() if k != "scale"},
-                      "scale": d["scale"] * s}
-                for sig, d in base_mats.items()
-            }
+            mats = {}
+            for adapter in adapters:
+                path = _resolve_lora_path(adapter["lora"])
+                if path not in file_cache:
+                    file_cache[path] = _load_lora_matrices(path)
+                base_mats = file_cache[path]
+                if not base_mats:
+                    continue
+                total_adapters += 1
+                for sig, d in base_mats.items():
+                    mats.setdefault(sig, []).append({
+                        **{k: v for k, v in d.items() if k != "scale"},
+                        "scale": d["scale"] * float(adapter["effective_strength"]),
+                    })
             region_loras.append(mats)
 
         patched = model.clone()
-        n_lora = sum(1 for m in region_loras if m)
-        if n_lora:
+        if total_adapters:
             session = session_cls(
                 patched, region_loras, norm_boxes,
                 float(seam_feather), float(blend_override), cw, ch,
@@ -1499,7 +1515,7 @@ class Krea2RegionalMultiLoRAV9(Krea2RegionalMultiLoRAV7):
                 patched.add_wrapper(_WRAPPER_ENUM, wrapper)
             else:
                 raise RuntimeError("ComfyUI build lacks model wrapper support.")
-        return patched, strength_eff, n_lora
+        return patched, region_adapters, total_adapters
 
     def _arm_photo_molds(
         self, patched, vae, active, norm_boxes, ref_strength,

@@ -4,7 +4,7 @@ Distant subjects only get a handful of latent pixels, so even a perfectly
 routed LoRA cannot express full identity detail. This node runs AFTER the
 main generation: for each region in the V12 detail plan it crops the
 subject's box (with padding), upscales the crop, re-renders it img2img with
-that region's character LoRA patched into the whole model (a crop contains
+that region's active LoRA adapters patched into the whole model (a crop contains
 only its own subject, so no regional masking is needed), then pastes the
 result back with a feathered seam. An optional second pass does the same on
 the detected face inside the refined crop for maximum identity fidelity.
@@ -163,7 +163,7 @@ class Krea2RegionalDetailer:
                 }),
                 "data": ("KREA2_DATA", {
                     "tooltip": "data output of the V12 node (carries the "
-                               "detail plan: box + LoRA per region).",
+                               "detail plan: box + LoRA list per region).",
                 }),
                 "enable": ("BOOLEAN", {
                     "default": True,
@@ -247,8 +247,7 @@ class Krea2RegionalDetailer:
         plan = (data or {}).get("detail_plan") if isinstance(data, dict) else None
         plan = [
             p for p in (plan or [])
-            if p.get("lora") not in ("", "None", None)
-            and float(p.get("strength", 0.0)) != 0.0
+            if self._active_loras(p, lora_scale)
         ]
         if not enable or not plan:
             if enable:
@@ -320,7 +319,8 @@ class Krea2RegionalDetailer:
                         continue
                     logging.info(
                         "[Krea2Detailer] face pass '%s' (%s) at "
-                        "x=%.3f y=%.3f", label, entry.get("lora"),
+                        "x=%.3f y=%.3f", label,
+                        ", ".join(a["lora"] for a in self._active_loras(entry, lora_scale)),
                         (fx0 + fx1) / 2.0 / width,
                         (fy0 + fy1) / 2.0 / height,
                     )
@@ -360,19 +360,59 @@ class Krea2RegionalDetailer:
         ).to(out.dtype).cpu()
 
     @staticmethod
+    def _active_loras(entry, lora_scale):
+        adapters = []
+        for adapter in entry.get("loras", []) if isinstance(entry, dict) else []:
+            if not isinstance(adapter, dict) or not bool(adapter.get("enable", True)):
+                continue
+            lora = adapter.get("lora")
+            if lora in ("", "None", None):
+                continue
+            try:
+                strength = float(adapter.get("strength", 1.0))
+            except (TypeError, ValueError):
+                strength = 1.0
+            effective = strength * float(lora_scale)
+            if effective == 0.0:
+                continue
+            adapters.append({
+                "lora": str(lora),
+                "strength": effective,
+                "base_strength": strength,
+            })
+        return adapters
+
+    @staticmethod
     def _lora_models(model, clip, entry, lora_scale, cache):
-        strength = float(entry.get("strength", 1.0)) * float(lora_scale)
-        key = (entry["lora"], round(strength, 4))
-        if key not in cache:
-            path = _resolve_lora_path(entry["lora"])
-            lora_sd = comfy.utils.load_torch_file(path, safe_load=True)
-            cache[key] = comfy.sd.load_lora_for_models(
-                model, clip, lora_sd, strength, strength)
+        adapters = Krea2RegionalDetailer._active_loras(entry, lora_scale)
+        if not adapters:
+            return model, clip
+        key = tuple((a["lora"], round(a["strength"], 4)) for a in adapters)
+        stack_cache = cache.setdefault("stack", {})
+        if key in stack_cache:
+            return stack_cache[key]
+
+        model_l, clip_l = model, clip
+        sd_cache = cache.setdefault("sd", {})
+        for adapter in adapters:
+            path = _resolve_lora_path(adapter["lora"])
+            if path not in sd_cache:
+                sd_cache[path] = comfy.utils.load_torch_file(path, safe_load=True)
+            model_l, clip_l = comfy.sd.load_lora_for_models(
+                model_l,
+                clip_l,
+                sd_cache[path],
+                adapter["strength"],
+                adapter["strength"],
+            )
             logging.info(
                 "[Krea2Detailer] LoRA %s @ %.2f (regional %.2f x scale)",
-                entry["lora"], strength, float(entry.get("strength", 1.0)),
+                adapter["lora"],
+                adapter["strength"],
+                adapter["base_strength"],
             )
-        return cache[key]
+        stack_cache[key] = (model_l, clip_l)
+        return stack_cache[key]
 
     def _refine_crop(self, crop, model_l, clip_l, vae, prompt_text, denoise,
                      steps, cfg, sampler_name, scheduler, seed, target_px):

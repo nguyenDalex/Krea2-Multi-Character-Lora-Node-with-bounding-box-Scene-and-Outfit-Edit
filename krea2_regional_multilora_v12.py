@@ -17,7 +17,7 @@ import re
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from .krea2_regional_multilora import _rect_token_mask_inward
+from .krea2_regional_multilora import _active_loras, _rect_token_mask_inward
 from .krea2_regional_multilora_v3 import _parse_regions_v3
 from .krea2_regional_multilora_v9 import (
     Krea2RegionalMultiLoRAV9,
@@ -226,9 +226,7 @@ def _compile_unified_plan(clip, builder_prompt, regions_json):
     for index, region in enumerate(parsed):
         if not region.get("enable", True):
             continue
-        has_lora = region.get("lora") not in ("", "None", None) and float(
-            region.get("strength", 0.0)
-        ) != 0.0
+        has_lora = bool(_active_loras(region, 1.0))
         has_ref = bool(region.get("ref_image")) and region.get("ref_enable", True)
         if not (has_lora or has_ref):
             continue
@@ -859,12 +857,14 @@ class Krea2RegionalMultiLoRAV12(Krea2RegionalMultiLoRAV9):
             detail_plan = []
             for label, box, index in zip(plan.labels, plan.boxes, plan.indices):
                 region = parsed[index] if index < len(parsed) else {}
+                adapters = _active_loras(region, base_strength)
                 detail_plan.append({
                     "label": label,
                     "box": [float(v) for v in box],
-                    "lora": str(region.get("lora", "") or ""),
-                    "strength": float(region.get("strength", 1.0))
-                    * float(base_strength),
+                    "loras": [
+                        {"lora": a["lora"], "strength": float(a["effective_strength"])}
+                        for a in adapters
+                    ],
                 })
             payload.update({
                 "engine": "v12_unified_spatial",
