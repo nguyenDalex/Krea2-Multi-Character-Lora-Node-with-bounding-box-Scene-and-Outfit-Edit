@@ -63,7 +63,7 @@ DEFAULT_REGIONS_JSON = (
 # ---------------------------------------------------------------------------
 # region / bbox parsing
 # ---------------------------------------------------------------------------
-def _normalize_lora_adapter(adapter) -> dict | None:
+def _normalize_lora_adapter(adapter):
     if not isinstance(adapter, dict):
         return None
     lora = str(adapter.get("lora", "None") or "None")
@@ -78,7 +78,7 @@ def _normalize_lora_adapter(adapter) -> dict | None:
     }
 
 
-def _legacy_lora_adapter(item) -> dict | None:
+def _legacy_lora_adapter(item):
     if not any(k in item for k in ("lora", "lora_name", "strength", "strength_model")):
         return None
     return _normalize_lora_adapter({
