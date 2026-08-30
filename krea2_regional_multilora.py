@@ -63,6 +63,31 @@ DEFAULT_REGIONS_JSON = (
 # ---------------------------------------------------------------------------
 # region / bbox parsing
 # ---------------------------------------------------------------------------
+def _normalize_lora_adapter(adapter) -> dict | None:
+    if not isinstance(adapter, dict):
+        return None
+    lora = str(adapter.get("lora", "None") or "None")
+    try:
+        strength = float(adapter.get("strength", 1.0))
+    except (TypeError, ValueError):
+        strength = 1.0
+    return {
+        "lora": lora,
+        "strength": strength,
+        "enable": bool(adapter.get("enable", True)),
+    }
+
+
+def _legacy_lora_adapter(item) -> dict | None:
+    if not any(k in item for k in ("lora", "lora_name", "strength", "strength_model")):
+        return None
+    return _normalize_lora_adapter({
+        "lora": item.get("lora", item.get("lora_name", "None")),
+        "strength": item.get("strength", item.get("strength_model", 1.0)),
+        "enable": True,
+    })
+
+
 def _parse_regions(regions_json: str) -> list:
     if not regions_json or not regions_json.strip():
         return []
@@ -85,29 +110,24 @@ def _parse_regions(regions_json: str) -> list:
         loras = []
         raw_loras = item.get("loras", None)
 
-        # Back-compat: older workflows used top-level {lora,strength,enable} fields.
-        if not isinstance(raw_loras, list):
-            raw_loras = []
-        if not raw_loras and any(k in item for k in ("lora", "lora_name", "strength", "strength_model")):
-            raw_loras = [{
-                "lora": item.get("lora", item.get("lora_name", "None")),
-                "strength": item.get("strength", item.get("strength_model", 1.0)),
-                "enable": True,
-            }]
+        if isinstance(raw_loras, list):
+            candidates = raw_loras
+        elif isinstance(raw_loras, dict):
+            candidates = [raw_loras]
+        else:
+            candidates = []
 
-        for adapter in raw_loras:
-            if not isinstance(adapter, dict):
-                continue
-            lora = str(adapter.get("lora", "None") or "None")
-            try:
-                strength = float(adapter.get("strength", 1.0))
-            except (TypeError, ValueError):
-                strength = 1.0
-            loras.append({
-                "lora": lora,
-                "strength": strength,
-                "enable": bool(adapter.get("enable", True)),
-            })
+        for adapter in candidates:
+            normalized = _normalize_lora_adapter(adapter)
+            if normalized is not None:
+                loras.append(normalized)
+
+        # Back-compat: older workflows used top-level {lora,strength,enable} fields.
+        if not loras:
+            legacy_adapter = _legacy_lora_adapter(item)
+            if legacy_adapter is not None:
+                loras.append(legacy_adapter)
+
         out.append({"name": name, "enable": enable, "loras": loras})
     return out
 

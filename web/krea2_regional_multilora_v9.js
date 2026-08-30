@@ -50,26 +50,47 @@ function defaultLora() {
   return { lora: "None", strength: 1.0, enable: true };
 }
 
+function normalizeLoraAdapter(adapter) {
+  if (!adapter || typeof adapter !== "object") return null;
+  const strength = Number(adapter.strength);
+  return {
+    lora: typeof adapter.lora === "string" ? adapter.lora : "None",
+    strength: Number.isFinite(strength) ? strength : 1.0,
+    enable: adapter.enable !== false,
+  };
+}
+
+function legacyLoraAdapter(region) {
+  const hasLegacy = ("lora" in region) || ("lora_name" in region) || ("strength" in region) || ("strength_model" in region);
+  if (!hasLegacy) return null;
+  const legacyLora = typeof region.lora === "string"
+    ? region.lora
+    : (typeof region.lora_name === "string" ? region.lora_name : "None");
+  const strengthRaw = (region.strength ?? region.strength_model);
+  const strength = Number(strengthRaw);
+  return {
+    lora: legacyLora || "None",
+    strength: Number.isFinite(strength) ? strength : 1.0,
+    enable: true,
+  };
+}
+
 function normalizeRegion(region) {
   const r = (region && typeof region === "object") ? region : {};
-
-  // Back-compat: older workflows used top-level {lora,strength,enable}.
-  const hasLegacy = ("lora" in r) || ("lora_name" in r) || ("strength" in r) || ("strength_model" in r);
-  const legacyLora = typeof r.lora === "string"
-    ? r.lora
-    : (typeof r.lora_name === "string" ? r.lora_name : "None");
-  const legacyStrengthRaw = (r.strength ?? r.strength_model);
-  const legacyStrength = Number.isFinite(Number(legacyStrengthRaw)) ? Number(legacyStrengthRaw) : 1.0;
-
-  const loras = Array.isArray(r.loras)
-    ? r.loras
-        .filter((x) => x && typeof x === "object")
-        .map((x) => ({
-          lora: typeof x.lora === "string" ? x.lora : "None",
-          strength: Number.isFinite(Number(x.strength)) ? Number(x.strength) : 1.0,
-          enable: x.enable !== false,
-        }))
-    : (hasLegacy ? [{ lora: legacyLora || "None", strength: legacyStrength, enable: true }] : []);
+  const loras = [];
+  if (Array.isArray(r.loras)) {
+    for (const item of r.loras) {
+      const normalized = normalizeLoraAdapter(item);
+      if (normalized) loras.push(normalized);
+    }
+  } else if (r.loras && typeof r.loras === "object") {
+    const normalized = normalizeLoraAdapter(r.loras);
+    if (normalized) loras.push(normalized);
+  }
+  if (loras.length === 0) {
+    const legacy = legacyLoraAdapter(r);
+    if (legacy) loras.push(legacy);
+  }
 
   return {
     ...r,
