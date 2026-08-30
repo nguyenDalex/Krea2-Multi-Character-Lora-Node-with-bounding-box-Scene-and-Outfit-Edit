@@ -14,6 +14,7 @@ import { api } from "../../scripts/api.js";
 
 const NODE_TYPE = "Krea2RegionalMultiLoRA";
 const JSON_WIDGET = "regions_json";
+const ZERO_SYNC_GRACE_MS = 1200;
 
 let LORA_LIST = ["None"];
 
@@ -130,6 +131,7 @@ function syncRegionCount(node, targetCount) {
 function checkAndSync(node) {
   const count = getBboxCount(node);
   if (count === null) return;
+  if (count !== 0) node.__k2pendingZeroSince = null;
   if (count === node.__k2lastBboxCount) return;
 
   if (
@@ -139,6 +141,15 @@ function checkAndSync(node) {
     Date.now() < node.__k2loadGuardUntil
   ) {
     return; // load-race guard: don't clear rows before the builder restores
+  }
+  if (count === 0 && readRegions(node).length > 0) {
+    const now = Date.now();
+    if (!node.__k2pendingZeroSince) {
+      node.__k2pendingZeroSince = now;
+      return;
+    }
+    if (now - node.__k2pendingZeroSince < ZERO_SYNC_GRACE_MS) return;
+    node.__k2pendingZeroSince = null;
   }
 
   node.__k2lastBboxCount = count;
@@ -244,6 +255,7 @@ app.registerExtension({
     nodeType.prototype.onNodeCreated = function () {
       const r = onNodeCreated ? onNodeCreated.apply(this, arguments) : undefined;
       this.__k2lastBboxCount = null;
+      this.__k2pendingZeroSince = null;
 
       const addBtn = this.addWidget("button", "+ Add Region", null, () => {
         const regions = readRegions(this);
@@ -261,6 +273,7 @@ app.registerExtension({
     nodeType.prototype.onConfigure = function (o) {
       const r = onConfigure ? onConfigure.apply(this, arguments) : undefined;
       this.__k2lastBboxCount = null;
+      this.__k2pendingZeroSince = null;
       // Protect the restored rows from being cleared to zero while a connected
       // builder is still restoring its own boxes during graph load.
       this.__k2loadGuardUntil = Date.now() + 2500;
@@ -279,6 +292,7 @@ app.registerExtension({
       const bboxIdx = this.inputs?.findIndex((i) => i.name === "bboxes");
       if (index === bboxIdx) {
         this.__k2lastBboxCount = null; // force re-check
+        this.__k2pendingZeroSince = null;
         // A fresh manual wire is a deliberate user action, not load - drop the
         // guard so connecting an empty builder can still show zero rows.
         if (connected) this.__k2loadGuardUntil = 0;
