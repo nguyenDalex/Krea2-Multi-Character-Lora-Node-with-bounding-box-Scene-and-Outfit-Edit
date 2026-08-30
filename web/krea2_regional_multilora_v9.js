@@ -1,6 +1,7 @@
 // Krea2 Regional Multi-LoRA v9 — V2 LoRA+mold likeness always; krea2edit opt-in.
-// Per-region rows: LoRA dropdown, strength stepper, enable, portrait prompt,
-// and in-node Load Ref upload (regions_json.ref_image). Standalone LoadImage
+// Per-region rows: region enable, multiple LoRA rows (dropdown + strength +
+// adapter enable), portrait prompt, and in-node Load Ref upload
+// (regions_json.ref_image). Standalone LoadImage
 // plates wire to extra_ref_1/2 for editing anything. No auto-portraits.
 
 import { app } from "../../scripts/app.js";
@@ -39,8 +40,71 @@ async function ensureLoraList() {
 
 function defaultRegion() {
   return {
-    lora: "None", strength: 1.0, enable: true,
+    loras: [{ lora: "None", strength: 1.0, enable: true }],
+    enable: true,
     ref_image: "", ref_enable: true, prompt: "", portrait: false,
+  };
+}
+
+function defaultLora() {
+  return { lora: "None", strength: 1.0, enable: true };
+}
+
+function normalizeLoraAdapter(adapter) {
+  if (!adapter || typeof adapter !== "object") return null;
+  const strength = Number(adapter.strength);
+  return {
+    lora: typeof adapter.lora === "string" ? adapter.lora : "None",
+    strength: Number.isFinite(strength) ? strength : 1.0,
+    enable: adapter.enable !== false,
+  };
+}
+
+function legacyLoraAdapter(region) {
+  const hasLegacy = ("lora" in region) || ("lora_name" in region) || ("strength" in region) || ("strength_model" in region);
+  if (!hasLegacy) return null;
+  const legacyLora = typeof region.lora === "string"
+    ? region.lora
+    : (typeof region.lora_name === "string" ? region.lora_name : "None");
+  const strengthRaw = (region.strength ?? region.strength_model);
+  const strength = Number(strengthRaw);
+  return {
+    lora: legacyLora || "None",
+    strength: Number.isFinite(strength) ? strength : 1.0,
+    enable: true,
+  };
+}
+
+function normalizeRegion(region) {
+  const r = (region && typeof region === "object") ? region : {};
+  const loras = [];
+  if (Array.isArray(r.loras)) {
+    for (const item of r.loras) {
+      const normalized = normalizeLoraAdapter(item);
+      if (normalized) loras.push(normalized);
+    }
+  } else if (r.loras && typeof r.loras === "object") {
+    const normalized = normalizeLoraAdapter(r.loras);
+    if (normalized) loras.push(normalized);
+  }
+  if (loras.length === 0) {
+    const legacy = legacyLoraAdapter(r);
+    if (legacy) loras.push(legacy);
+  }
+
+  return {
+    ...r,
+    // Drop legacy fields when re-serializing.
+    lora: undefined,
+    strength: undefined,
+    lora_name: undefined,
+    strength_model: undefined,
+    enable: r.enable !== false,
+    loras,
+    ref_image: String(r.ref_image || ""),
+    ref_enable: r.ref_enable !== false,
+    prompt: String(r.prompt || ""),
+    portrait: r.portrait === true,
   };
 }
 
@@ -49,7 +113,7 @@ function readRegions(node) {
   if (!w) return [];
   try {
     const parsed = JSON.parse(w.value || "[]");
-    return Array.isArray(parsed) ? parsed : [];
+    return Array.isArray(parsed) ? parsed.map((r) => normalizeRegion(r)) : [];
   } catch (e) {
     return [];
   }
@@ -82,7 +146,7 @@ function clampStrength(v) {
   return Math.max(STRENGTH_MIN, Math.min(STRENGTH_MAX, Math.round(v * 100) / 100));
 }
 
-function makeStrengthWidget(node, idx, region) {
+function makeStrengthWidget(node, regionIdx, loraIdx, lora) {
   const ctrl = { repeatTimer: null, repeatCount: 0, lastStepAt: 0, streak: 0, holdDir: 0 };
 
   function clearRepeat() {
@@ -108,10 +172,11 @@ function makeStrengthWidget(node, idx, region) {
     const delta = STRENGTH_BASE_STEP * clickMult * direction;
 
     const r = readRegions(node);
-    if (!r[idx]) return;
-    r[idx].strength = clampStrength((r[idx].strength ?? 1.0) + delta);
+    if (!r[regionIdx]?.loras?.[loraIdx]) return;
+    r[regionIdx].loras[loraIdx].strength =
+      clampStrength((r[regionIdx].loras[loraIdx].strength ?? 1.0) + delta);
     writeRegions(node, r);
-    w.value = r[idx].strength;
+    w.value = r[regionIdx].loras[loraIdx].strength;
     node.setDirtyCanvas(true, true);
   }
 
@@ -133,8 +198,8 @@ function makeStrengthWidget(node, idx, region) {
 
   const w = {
     type: "K2V7STR",
-    name: `region ${idx + 1} strength`,
-    value: typeof region.strength === "number" ? region.strength : 1.0,
+    name: `region ${regionIdx + 1} lora ${loraIdx + 1} strength`,
+    value: typeof lora.strength === "number" ? lora.strength : 1.0,
     serialize: false,
     options: { serialize: false },
     computeSize(width) {
@@ -156,7 +221,7 @@ function makeStrengthWidget(node, idx, region) {
       ctx.font = "11px Arial";
       ctx.textAlign = "left";
       ctx.textBaseline = "middle";
-      ctx.fillText(`region ${idx + 1} strength`, margin, midY);
+      ctx.fillText(`region ${regionIdx + 1} lora ${loraIdx + 1} strength`, margin, midY);
 
       ctx.fillStyle = "#353535";
       ctx.strokeStyle = "#555";
@@ -185,10 +250,10 @@ function makeStrengthWidget(node, idx, region) {
         if (inBox(this.__valBounds)) {
           app.canvas.prompt("Strength", w.value, (v) => {
             const r = readRegions(mNode);
-            if (!r[idx]) return;
-            r[idx].strength = clampStrength(Number(v));
+            if (!r[regionIdx]?.loras?.[loraIdx]) return;
+            r[regionIdx].loras[loraIdx].strength = clampStrength(Number(v));
             writeRegions(mNode, r);
-            w.value = r[idx].strength;
+            w.value = r[regionIdx].loras[loraIdx].strength;
             mNode.setDirtyCanvas(true, true);
           }, event);
           return true;
@@ -426,15 +491,57 @@ function rebuildRows(node) {
     );
     markTransient(enableW);
 
-    const loraW = node.addWidget(
-      "combo", `region ${idx + 1} lora`, region.lora || "None",
-      (v) => { const r = readRegions(node); if (r[idx]) { r[idx].lora = v; writeRegions(node, r); } },
-      { values: LORA_LIST }
-    );
-    markTransient(loraW);
+    region.loras.forEach((lora, loraIdx) => {
+      const loraW = node.addWidget(
+        "combo", `region ${idx + 1} lora ${loraIdx + 1}`, lora.lora || "None",
+        (v) => {
+          const r = readRegions(node);
+          if (r[idx]?.loras?.[loraIdx]) {
+            r[idx].loras[loraIdx].lora = v;
+            writeRegions(node, r);
+          }
+        },
+        { values: LORA_LIST }
+      );
+      markTransient(loraW);
 
-    if (node.addCustomWidget) node.addCustomWidget(makeStrengthWidget(node, idx, region));
-    else node.widgets.push(makeStrengthWidget(node, idx, region));
+      if (node.addCustomWidget) node.addCustomWidget(makeStrengthWidget(node, idx, loraIdx, lora));
+      else node.widgets.push(makeStrengthWidget(node, idx, loraIdx, lora));
+
+      const loraEnableW = node.addWidget(
+        "toggle", `region ${idx + 1} lora ${loraIdx + 1} enabled`, lora.enable !== false,
+        (v) => {
+          const r = readRegions(node);
+          if (r[idx]?.loras?.[loraIdx]) {
+            r[idx].loras[loraIdx].enable = v;
+            writeRegions(node, r);
+          }
+        },
+        { on: "on", off: "off" }
+      );
+      markTransient(loraEnableW);
+
+      const rmLoraW = node.addWidget("button", `  remove lora ${loraIdx + 1} (region ${idx + 1})`, null, () => {
+        const r = readRegions(node);
+        if (!r[idx]?.loras) return;
+        r[idx].loras.splice(loraIdx, 1);
+        writeRegions(node, r);
+        rebuildRows(node);
+        node.setDirtyCanvas(true, true);
+      });
+      markTransient(rmLoraW);
+    });
+
+    const addLoraW = node.addWidget("button", `+ Add LoRA (region ${idx + 1})`, null, () => {
+      const r = readRegions(node);
+      if (!r[idx]) return;
+      if (!Array.isArray(r[idx].loras)) r[idx].loras = [];
+      r[idx].loras.push(defaultLora());
+      writeRegions(node, r);
+      rebuildRows(node);
+      node.setDirtyCanvas(true, true);
+    });
+    markTransient(addLoraW);
 
     // Per-region portrait prompt: guides the LoRA-only auto portrait (e.g. "a man").
     const promptW = node.addWidget(
@@ -447,8 +554,8 @@ function rebuildRows(node) {
     // Per-region portrait opt-in. Only offered when the region has no live
     // reference photo, because a photo already supplies the subject frame and
     // the portrait would never be rendered. Costs an extra render plus a model
-    // reload, so it is a deliberate per-LoRA choice: switch it on to inspect how
-    // faithful a LoRA is alone, off once you trust it.
+    // reload; when multiple LoRAs are configured in a region, the backend uses
+    // the first active adapter as the portrait source.
     const refLive = !!region.ref_image && region.ref_enable !== false;
     if (!refLive) {
       const portraitW = node.addWidget(

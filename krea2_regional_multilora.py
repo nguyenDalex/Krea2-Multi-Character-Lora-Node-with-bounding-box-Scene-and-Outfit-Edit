@@ -21,8 +21,13 @@ Features:
 
 regions_json schema:
     [
-      {"lora": "character_A.safetensors", "strength": 1.1, "enable": true},
-      {"lora": "character_B.safetensors", "strength": 1.1, "enable": true}
+      {"enable": true, "loras": [
+        {"lora": "character_A.safetensors", "strength": 1.1, "enable": true},
+        {"lora": "outfit_A.safetensors", "strength": 0.8, "enable": true}
+      ]},
+      {"enable": true, "loras": [
+        {"lora": "character_B.safetensors", "strength": 1.1, "enable": true}
+      ]}
     ]
 """
 
@@ -49,8 +54,8 @@ _COMPUTE_DTYPE = torch.bfloat16
 
 DEFAULT_REGIONS_JSON = (
     "[\n"
-    '  {"lora": "None", "strength": 1.1, "enable": true},\n'
-    '  {"lora": "None", "strength": 1.1, "enable": true}\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.1, "enable": true}]},\n'
+    '  {"enable": true, "loras": [{"lora": "None", "strength": 1.1, "enable": true}]}\n'
     "]"
 )
 
@@ -58,6 +63,31 @@ DEFAULT_REGIONS_JSON = (
 # ---------------------------------------------------------------------------
 # region / bbox parsing
 # ---------------------------------------------------------------------------
+def _normalize_lora_adapter(adapter):
+    if not isinstance(adapter, dict):
+        return None
+    lora = str(adapter.get("lora", "None") or "None")
+    try:
+        strength = float(adapter.get("strength", 1.0))
+    except (TypeError, ValueError):
+        strength = 1.0
+    return {
+        "lora": lora,
+        "strength": strength,
+        "enable": bool(adapter.get("enable", True)),
+    }
+
+
+def _legacy_lora_adapter(item):
+    if not any(k in item for k in ("lora", "lora_name", "strength", "strength_model")):
+        return None
+    return _normalize_lora_adapter({
+        "lora": item.get("lora", item.get("lora_name", "None")),
+        "strength": item.get("strength", item.get("strength_model", 1.0)),
+        "enable": True,
+    })
+
+
 def _parse_regions(regions_json: str) -> list:
     if not regions_json or not regions_json.strip():
         return []
@@ -75,15 +105,60 @@ def _parse_regions(regions_json: str) -> list:
     for i, item in enumerate(raw):
         if not isinstance(item, dict):
             continue
-        lora = str(item.get("lora", item.get("lora_name", "None")) or "None")
-        try:
-            strength = float(item.get("strength", item.get("strength_model", 1.0)))
-        except (TypeError, ValueError):
-            strength = 1.0
         enable = bool(item.get("enable", True))
         name = str(item.get("name", "") or f"region{i}").strip() or f"region{i}"
-        out.append({"name": name, "lora": lora, "strength": strength, "enable": enable})
+        loras = []
+        raw_loras = item.get("loras", None)
+
+        if isinstance(raw_loras, list):
+            candidates = raw_loras
+        elif isinstance(raw_loras, dict):
+            candidates = [raw_loras]
+        else:
+            candidates = []
+
+        for adapter in candidates:
+            normalized = _normalize_lora_adapter(adapter)
+            if normalized is not None:
+                loras.append(normalized)
+
+        # Back-compat: older workflows used top-level {lora,strength,enable} fields.
+        if not loras:
+            legacy_adapter = _legacy_lora_adapter(item)
+            if legacy_adapter is not None:
+                loras.append(legacy_adapter)
+
+        out.append({"name": name, "enable": enable, "loras": loras})
     return out
+
+
+def _active_loras(region, base_strength=1.0):
+    active = []
+    for adapter in region.get("loras", []):
+        if not bool(adapter.get("enable", True)):
+            continue
+        lora = adapter.get("lora")
+        if lora in ("", "None", None):
+            continue
+        try:
+            strength = float(adapter.get("strength", 1.0))
+        except (TypeError, ValueError):
+            strength = 1.0
+        effective_strength = strength * float(base_strength)
+        if effective_strength == 0.0:
+            continue
+        active.append({
+            "lora": str(lora),
+            "strength": strength,
+            "enable": True,
+            "effective_strength": effective_strength,
+        })
+    return active
+
+
+def _primary_lora(region, base_strength=1.0):
+    active = _active_loras(region, base_strength=base_strength)
+    return active[0] if active else None
 
 
 def _normalize_bboxes(bboxes) -> list:
@@ -484,7 +559,7 @@ class _RegionalSession:
         self._patcher_ref = (
             weakref.ref(patcher) if patcher is not None else (lambda: None)
         )
-        self.region_loras = region_loras      # [{sig: {down,up,scale}}] per region
+        self.region_loras = region_loras      # [{sig: [{down,up,scale}, ...]}] per region
         self.norm_boxes = norm_boxes          # [(x0,y0,x1,y1)] per region
         self.seam_feather = seam_feather
         self.blend_override = blend_override
@@ -515,9 +590,8 @@ class _RegionalSession:
         for name, mod in _iter_named_linears(dm):
             sig = _norm_key(name)
             entries = []
-            for ridx, lora in enumerate(self.region_loras):
-                d = lora.get(sig)
-                if d is not None:
+            for ridx, region_lora in enumerate(self.region_loras):
+                for d in region_lora.get(sig, []):
                     entries.append((ridx, d))
                     matched_per_region[ridx] += 1
             if entries:
@@ -525,7 +599,7 @@ class _RegionalSession:
                 # node output would pin the whole UNet after its patchers die.
                 layer_map[name] = (weakref.ref(mod), entries)
         for ridx, count in enumerate(matched_per_region):
-            targets = len(self.region_loras[ridx])
+            targets = sum(len(deltas) for deltas in self.region_loras[ridx].values())
             logging.info("[Krea2RegionalMultiLoRA] region %d: matched %d/%d LoRA layers.",
                          ridx, count, targets)
             if count == 0 and targets > 0:
@@ -701,7 +775,7 @@ class Krea2RegionalMultiLoRA:
                     "tooltip": (
                         "JSON array of regions (one per character), in canvas order. "
                         "The 'Add Region' / 'Remove' buttons edit this for you. "
-                        'Each: {"lora": "file.safetensors", "strength": 1.1, "enable": true}. '
+                        'Each region has "loras": [{"lora":"file.safetensors","strength":1.1,"enable":true}, ...]. '
                         "Region i maps to bounding-box i when split_mode=bbox."
                     ),
                 }),
@@ -773,12 +847,12 @@ class Krea2RegionalMultiLoRA:
         regions = _parse_regions(regions_json)
         enabled = [
             r for r in regions
-            if r["enable"] and r["lora"] not in ("None", "") and (r["strength"] * base_strength) != 0.0
+            if r["enable"] and _active_loras(r, base_strength)
         ]
 
         empty_masks = {"masks": {}, "similarity_maps": {}, "text_mask_value": float(blend_override)}
         if not enabled:
-            logging.warning("[Krea2RegionalMultiLoRA] No enabled regions with a LoRA; passing model through.")
+            logging.warning("[Krea2RegionalMultiLoRA] No enabled regions with an active LoRA; passing model through.")
             return (model, clip, empty_masks, {"adapters": []})
 
         cw, ch = int(canvas_width), int(canvas_height)
@@ -805,25 +879,32 @@ class Krea2RegionalMultiLoRA:
         # Load each region's LoRA matrices (cached per file).
         file_cache = {}
         region_loras = []
-        strength_eff = []
+        active_region_loras = []
+        total_adapters = 0
         for r in enabled:
-            path = _resolve_lora_path(r["lora"])
-            if path not in file_cache:
-                file_cache[path] = _load_lora_matrices(path)
-            base_mats = file_cache[path]
-            s = r["strength"] * float(base_strength)
-            strength_eff.append(s)
-            # per-region shallow copy with per-region scale (so the same file can
-            # be used at different strengths in different regions)
-            mats = {
-                sig: {**{k: v for k, v in d.items() if k != "scale"},
-                      "scale": d["scale"] * s}
-                for sig, d in base_mats.items()
-            }
-            if not mats:
-                logging.warning("[Krea2RegionalMultiLoRA] '%s' contains no LoRA (A/B) or "
-                                "LoKr (kron factor) pairs - raw-diff files belong in a "
-                                "normal LoraLoader, not here.", r["lora"])
+            adapters = _active_loras(r, base_strength)
+            active_region_loras.append(adapters)
+            mats = {}
+            for adapter in adapters:
+                path = _resolve_lora_path(adapter["lora"])
+                if path not in file_cache:
+                    file_cache[path] = _load_lora_matrices(path)
+                base_mats = file_cache[path]
+                if not base_mats:
+                    logging.warning(
+                        "[Krea2RegionalMultiLoRA] '%s' contains no LoRA (A/B) or "
+                        "LoKr (kron factor) pairs - raw-diff files belong in a "
+                        "normal LoraLoader, not here.",
+                        adapter["lora"],
+                    )
+                    continue
+                s = float(adapter["effective_strength"])
+                total_adapters += 1
+                for sig, d in base_mats.items():
+                    mats.setdefault(sig, []).append({
+                        **{k: v for k, v in d.items() if k != "scale"},
+                        "scale": d["scale"] * s,
+                    })
             region_loras.append(mats)
 
         patched = model.clone()
@@ -862,17 +943,24 @@ class Krea2RegionalMultiLoRA:
         }
         node_data = {
             "adapters": [
-                {"name": r["name"], "lora": r["lora"], "strength": s}
-                for r, s in zip(enabled, strength_eff)
+                {
+                    "name": r["name"],
+                    "loras": [
+                        {"lora": a["lora"], "strength": float(a["effective_strength"])}
+                        for a in adapters
+                    ],
+                }
+                for r, adapters in zip(enabled, active_region_loras)
             ],
             "model_type": "krea2",
             "engine": "activation_delta",
+            "lora_adapters": total_adapters,
         }
 
         logging.info(
-            "[Krea2RegionalMultiLoRA] armed: %d regions, split=%s, feather=%.2f, "
-            "blend=%.2f (masks are built at runtime from the real latent).",
-            len(enabled), split_mode, seam_feather, blend_override,
+            "[Krea2RegionalMultiLoRA] armed: %d regions, %d LoRA adapters, split=%s, "
+            "feather=%.2f, blend=%.2f (masks are built at runtime from the real latent).",
+            len(enabled), total_adapters, split_mode, seam_feather, blend_override,
         )
         return (patched, clip, masks_payload, node_data)
 
