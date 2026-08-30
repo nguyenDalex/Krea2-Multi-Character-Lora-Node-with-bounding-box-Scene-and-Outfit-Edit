@@ -2,6 +2,8 @@ import { app } from "../../scripts/app.js";
 
 const MODEL_FILE_RE = /\.(?:safetensors|ckpt|pt|pth|bin)$/i;
 const MIN_FAMILY_TOKEN_LENGTH = 3;
+const ORGANIZER_SETTING_ID = "FedorNodes.ModelOrganizer.Enabled";
+const ORGANIZER_SETTING_NAME = "Fedor Nodes: Organize model dropdowns into folders";
 const FEDOR_NODE_IDS = new Set([
   "Krea2BoxInpaintMask",
   "Krea2ReferenceLock",
@@ -197,19 +199,22 @@ function organizeModelMenu(menu) {
   marker.remove();
 }
 
-app.registerExtension({
-  name: "FedorNodes.ModelOrganizer",
-  nodeCreated(node) {
-    brandNode(node);
-  },
-  loadedGraphNode(node) {
-    // Saved workflows persist custom node titles, which override
-    // NODE_DISPLAY_NAME_MAPPINGS. Rebrand those existing titles on load.
-    brandNode(node);
-  },
-  setup() {
-    const style = document.createElement("style");
-    style.textContent = `
+let observer = null;
+let organizerStyle = null;
+
+function organizerEnabled() {
+  try {
+    const value = app.ui?.settings?.getSettingValue?.(ORGANIZER_SETTING_ID);
+    return value === undefined ? false : Boolean(value);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function enableOrganizer() {
+  if (!organizerStyle) {
+    organizerStyle = document.createElement("style");
+    organizerStyle.textContent = `
       .fedor-model-family {
         align-items: center;
         display: flex;
@@ -238,9 +243,11 @@ app.registerExtension({
         display: block !important;
       }
     `;
-    document.head.appendChild(style);
+    document.head.appendChild(organizerStyle);
+  }
 
-    const observer = new MutationObserver((mutations) => {
+  if (!observer) {
+    observer = new MutationObserver((mutations) => {
       for (const mutation of mutations) {
         for (const added of mutation.addedNodes) {
           if (!(added instanceof HTMLElement)) continue;
@@ -254,5 +261,43 @@ app.registerExtension({
       }
     });
     observer.observe(document.body, { childList: true, subtree: true });
+  }
+}
+
+function disableOrganizer() {
+  if (observer) {
+    observer.disconnect();
+    observer = null;
+  }
+  if (organizerStyle) {
+    organizerStyle.remove();
+    organizerStyle = null;
+  }
+}
+
+app.registerExtension({
+  name: "FedorNodes.ModelOrganizer",
+  nodeCreated(node) {
+    brandNode(node);
+  },
+  loadedGraphNode(node) {
+    // Saved workflows persist custom node titles, which override
+    // NODE_DISPLAY_NAME_MAPPINGS. Rebrand those existing titles on load.
+    brandNode(node);
+  },
+  setup() {
+    app.ui?.settings?.addSetting?.({
+      id: ORGANIZER_SETTING_ID,
+      name: ORGANIZER_SETTING_NAME,
+      type: "boolean",
+      defaultValue: false,
+      onChange: (value) => {
+        if (value) enableOrganizer();
+        else disableOrganizer();
+      },
+    });
+
+    if (organizerEnabled()) enableOrganizer();
+    else disableOrganizer();
   },
 });
