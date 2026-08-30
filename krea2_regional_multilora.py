@@ -83,21 +83,31 @@ def _parse_regions(regions_json: str) -> list:
         enable = bool(item.get("enable", True))
         name = str(item.get("name", "") or f"region{i}").strip() or f"region{i}"
         loras = []
-        raw_loras = item.get("loras", [])
-        if isinstance(raw_loras, list):
-            for adapter in raw_loras:
-                if not isinstance(adapter, dict):
-                    continue
-                lora = str(adapter.get("lora", "None") or "None")
-                try:
-                    strength = float(adapter.get("strength", 1.0))
-                except (TypeError, ValueError):
-                    strength = 1.0
-                loras.append({
-                    "lora": lora,
-                    "strength": strength,
-                    "enable": bool(adapter.get("enable", True)),
-                })
+        raw_loras = item.get("loras", None)
+
+        # Back-compat: older workflows used top-level {lora,strength,enable} fields.
+        if not isinstance(raw_loras, list):
+            raw_loras = []
+        if not raw_loras and any(k in item for k in ("lora", "lora_name", "strength", "strength_model")):
+            raw_loras = [{
+                "lora": item.get("lora", item.get("lora_name", "None")),
+                "strength": item.get("strength", item.get("strength_model", 1.0)),
+                "enable": True,
+            }]
+
+        for adapter in raw_loras:
+            if not isinstance(adapter, dict):
+                continue
+            lora = str(adapter.get("lora", "None") or "None")
+            try:
+                strength = float(adapter.get("strength", 1.0))
+            except (TypeError, ValueError):
+                strength = 1.0
+            loras.append({
+                "lora": lora,
+                "strength": strength,
+                "enable": bool(adapter.get("enable", True)),
+            })
         out.append({"name": name, "enable": enable, "loras": loras})
     return out
 
