@@ -52,6 +52,15 @@ function defaultLora() {
 
 function normalizeRegion(region) {
   const r = (region && typeof region === "object") ? region : {};
+
+  // Back-compat: older workflows used top-level {lora,strength,enable}.
+  const hasLegacy = ("lora" in r) || ("lora_name" in r) || ("strength" in r) || ("strength_model" in r);
+  const legacyLora = typeof r.lora === "string"
+    ? r.lora
+    : (typeof r.lora_name === "string" ? r.lora_name : "None");
+  const legacyStrengthRaw = (r.strength ?? r.strength_model);
+  const legacyStrength = Number.isFinite(Number(legacyStrengthRaw)) ? Number(legacyStrengthRaw) : 1.0;
+
   const loras = Array.isArray(r.loras)
     ? r.loras
         .filter((x) => x && typeof x === "object")
@@ -60,9 +69,15 @@ function normalizeRegion(region) {
           strength: Number.isFinite(Number(x.strength)) ? Number(x.strength) : 1.0,
           enable: x.enable !== false,
         }))
-    : [];
+    : (hasLegacy ? [{ lora: legacyLora || "None", strength: legacyStrength, enable: true }] : []);
+
   return {
     ...r,
+    // Drop legacy fields when re-serializing.
+    lora: undefined,
+    strength: undefined,
+    lora_name: undefined,
+    strength_model: undefined,
     enable: r.enable !== false,
     loras,
     ref_image: String(r.ref_image || ""),
