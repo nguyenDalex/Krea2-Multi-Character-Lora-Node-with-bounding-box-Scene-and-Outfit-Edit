@@ -264,6 +264,8 @@ app.registerExtension({
         rebuildRows(this);
       });
       addBtn.__k2add = true;
+      addBtn.serialize = false;
+      if (addBtn.options) addBtn.options.serialize = false;
 
       rebuildRows(this);
       return r;
